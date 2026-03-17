@@ -23,7 +23,7 @@ This repo gives you a small system you can copy into any codebase so agents work
    Audit the result against the plan, diff, and tests.
 
 
-Optional Skills to call after a session has been finished:
+Optional skills to run after you finish a session:
 
 - `$planr-status`
    Check the smallest honest verdict for the current scope.
@@ -39,10 +39,9 @@ mkdir -p .codex/skills
 cp -R /path/to/codex-planr/.planr .
 cp -R /path/to/codex-planr/.codex/skills/planr-* .codex/skills/
 cp /path/to/codex-planr/.codex/skills/planr-shared.md .codex/skills/
-./.planr/tooling/planr project init
 ```
 
-2. Tell Codex to update the following files that it matches your codebase
+2. Tell Codex to update the following files so they match your codebase:
 
 ```text
 Inspect my current codebase and rewrite `.planr/project/*.md` for this repository.
