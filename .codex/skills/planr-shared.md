@@ -6,13 +6,15 @@ Use this with any repo-local `planr-*` skill.
 
 - Prefer `python3 .planr/tooling/planr.py` whenever its command surface fits the task.
 - Do not hand-edit `.planr/status/current.json` or scaffold a new `.planr/plans/*.plan.md` file by hand when the CLI already covers that operation.
-- Do not invent unsupported `planr.py` subcommands. Today the CLI supports only `plan` and `status`.
+- Do not invent unsupported `planr.py` subcommands. Today the CLI supports `project`, `plan`, and `status`.
 
 ## Current CLI Surface
 
 Use these commands as the deterministic first path:
 
 ```bash
+python3 .planr/tooling/planr.py project init [--force]
+
 python3 .planr/tooling/planr.py plan new --title "..." --overview "..." [--todo id=content] [--slug slug] [--project]
 
 python3 .planr/tooling/planr.py status show [--scope scope-id]
@@ -34,21 +36,23 @@ python3 .planr/tooling/planr.py status set-verification --scope scope-id --verif
 
 ## Shared Read Order
 
-1. Use the CLI first for plan or status questions and for supported `.planr` mutations.
+1. Use the CLI first for project, plan, or status questions and for supported `.planr` mutations.
 2. Read the governing `.planr` artifacts next: relevant plan file, live scope state, and any explicitly referenced historical source doc still in scope.
-3. Read the project-context pack only when ownership, runtime boundaries, state boundaries, or quality gates matter:
+3. If `.planr/project/*.md` is missing or still generic starter text, run `python3 .planr/tooling/planr.py project init`, then inspect the target repo and rewrite the pack before making strong architecture or ownership decisions.
+4. Read the project-context pack only when ownership, runtime boundaries, state boundaries, or quality gates matter:
    - `.planr/project/product.md`
    - `.planr/project/ownership.md`
    - `.planr/project/flows.md`
    - `.planr/project/state-ssot.md`
    - `.planr/project/constraints.md`
    - `.planr/project/quality-gates.md`
-4. Drop to implementation files, tests, and path-scoped Git evidence only when the CLI and recorded `.planr` state are insufficient.
+5. Drop to implementation files, tests, and path-scoped Git evidence only when the CLI and recorded `.planr` state are insufficient.
 
 ## When CLI Coverage Ends
 
 - There is no `planr.py fix` command today.
 - There is no `planr.py review` command today.
+- `project init` only scaffolds or refreshes `.planr/project/*.md` and canonical project-context metadata. It does not inspect the codebase or make repo-specific ownership decisions by itself.
 - There is no general-purpose command for editing an existing plan body beyond `plan new`.
 - `planr-review` still requires direct path-scoped Git evidence.
 - `planr-fix` still requires direct code, test, and verification work.

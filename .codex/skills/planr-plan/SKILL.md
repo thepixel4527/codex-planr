@@ -12,6 +12,7 @@ A `planr-plan` is invalid if it skips the real code, omits per-phase checklists,
 ## CLI-First Rule
 
 - Read [../planr-shared.md](../planr-shared.md) first.
+- If `.planr/project/*.md` is missing or still generic starter text, run `python3 .planr/tooling/planr.py project init`, then inspect the target repo and rewrite those files before making strong architecture or ownership decisions.
 - Use `python3 .planr/tooling/planr.py plan new ...` to scaffold new plan files instead of hand-writing boilerplate.
 - There is no general plan-update command today. After scaffolding, edit the existing plan body directly.
 

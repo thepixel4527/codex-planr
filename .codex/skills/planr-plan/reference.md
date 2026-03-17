@@ -20,7 +20,7 @@ If a plan item cannot be checked against repo evidence later, it is too vague no
 
 ## Project Context Pack
 
-Before finalizing architecture-sensitive planning, confirm that the repo already has equivalent durable context or create/request the bootstrap pack under `.planr/project/`:
+Before finalizing architecture-sensitive planning, confirm that the repo already has equivalent durable context or run `python3 .planr/tooling/planr.py project init` to scaffold the bootstrap pack under `.planr/project/`:
 
 - `product.md`
 - `ownership.md`
@@ -28,6 +28,8 @@ Before finalizing architecture-sensitive planning, confirm that the repo already
 - `state-ssot.md`
 - `constraints.md`
 - `quality-gates.md`
+
+After `project init`, inspect the actual target codebase and rewrite those files so ownership, product, flow, state, and quality-gate guidance matches the repo instead of generic starter text.
 
 `.planr/status/current.json` is the global live status source. It does not replace the scoped plan document.
 

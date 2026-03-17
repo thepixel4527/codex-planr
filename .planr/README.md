@@ -62,6 +62,24 @@ python3 .planr/tooling/planr.py
 
 If you are not running from the repo root, pass `--repo-root <path>`.
 
+### Project Context Init
+
+Bootstrap or refresh the starter pack under `.planr/project/`:
+
+```bash
+python3 .planr/tooling/planr.py project init
+```
+
+Overwrite existing `.planr/project/*.md` files with the starter templates:
+
+```bash
+python3 .planr/tooling/planr.py project init --force
+```
+
+`project init` creates or refreshes the starter pack and canonical project-context metadata. It does **not** analyze the target repository or make repo-specific ownership decisions by itself.
+
+After running it, the agent must inspect the target codebase and rewrite `.planr/project/*.md` so product, ownership, flows, state sources of truth, and quality gates match the real repo.
+
 ### Read-Only Inspection
 
 Show the full live status:

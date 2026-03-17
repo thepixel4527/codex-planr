@@ -528,6 +528,63 @@ class PlanrCliTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "null")
 
+    def test_project_init_creates_project_pack_and_status_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".planr").mkdir(parents=True, exist_ok=True)
+
+            result = self.run_cli(root, "project", "init")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            payload = json.loads(result.stdout)
+            expected_files = [
+                ".planr/project/product.md",
+                ".planr/project/ownership.md",
+                ".planr/project/flows.md",
+                ".planr/project/state-ssot.md",
+                ".planr/project/constraints.md",
+                ".planr/project/quality-gates.md",
+            ]
+
+            self.assertEqual(payload["project_root"], ".planr/project")
+            self.assertEqual(payload["written"], expected_files)
+            self.assertEqual(payload["preserved_existing"], [])
+            self.assertEqual(payload["project_context_files"], expected_files)
+            self.assertIn("Inspect the target codebase and rewrite `.planr/project/*.md`", payload["next_step"])
+
+            ownership = read_text(root / ".planr" / "project" / "ownership.md")
+            self.assertIn("Define **your** codebase’s layers", ownership)
+
+            status = json.loads(read_text(root / ".planr" / "status" / "current.json"))
+            self.assertEqual(status["project_context"]["root"], ".planr/project")
+            self.assertEqual(status["project_context"]["files"], expected_files)
+            self.assertEqual(status["global_status"], "open")
+            self.assertEqual(status["scopes"], [])
+
+    def test_project_init_preserves_existing_files_without_force_and_overwrites_with_force(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_status_fixture(root)
+
+            project_root = root / ".planr" / "project"
+            project_root.mkdir(parents=True, exist_ok=True)
+            ownership_path = project_root / "ownership.md"
+            ownership_path.write_text("# Ownership\n\ncustom\n", encoding="utf-8")
+
+            first = self.run_cli(root, "project", "init")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            first_payload = json.loads(first.stdout)
+
+            self.assertIn(".planr/project/ownership.md", first_payload["preserved_existing"])
+            self.assertEqual(read_text(ownership_path), "# Ownership\n\ncustom\n")
+
+            second = self.run_cli(root, "project", "init", "--force")
+            self.assertEqual(second.returncode, 0, second.stderr)
+            second_payload = json.loads(second.stdout)
+
+            self.assertIn(".planr/project/ownership.md", second_payload["written"])
+            self.assertIn("Define **your** codebase’s layers", read_text(ownership_path))
+
     def test_invalid_repo_root_fails_fast(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -582,13 +639,14 @@ class PlanrSkillSmokeTests(unittest.TestCase):
         readme = read_text(REPO_ROOT / "README.md")
 
         self.assertTrue(shared_path.is_file())
-        self.assertIn("cp /path/to/codex-simple-tasks/.codex/skills/planr-shared.md .codex/skills/", readme)
+        self.assertIn("cp /path/to/codex-planr/.codex/skills/planr-shared.md .codex/skills/", readme)
         self.assertIn("planr-shared.md", readme)
 
     def test_shared_baseline_documents_actual_cli_surface(self) -> None:
         shared = read_text(SKILLS_ROOT / "planr-shared.md")
 
         expected_commands = [
+            "python3 .planr/tooling/planr.py project init",
             "python3 .planr/tooling/planr.py plan new",
             "python3 .planr/tooling/planr.py status show",
             "python3 .planr/tooling/planr.py status open",
@@ -603,6 +661,7 @@ class PlanrSkillSmokeTests(unittest.TestCase):
 
         self.assertIn("There is no `planr.py fix` command today.", shared)
         self.assertIn("There is no `planr.py review` command today.", shared)
+        self.assertIn("project init` only scaffolds or refreshes `.planr/project/*.md`", shared)
 
     def test_repo_local_planr_skills_reference_shared_baseline(self) -> None:
         for skill_name in ["planr-fix", "planr-plan", "planr-review", "planr-status", "planr-summary"]:
@@ -622,7 +681,16 @@ class PlanrSkillSmokeTests(unittest.TestCase):
         self.assertIn("There is no `planr.py fix` command today.", fix_skill)
         self.assertIn("There is no `planr.py review` command today.", review_skill)
         self.assertIn("There is no general plan-update command today.", plan_skill)
-        self.assertIn("Today the CLI supports only `plan` and `status`.", shared)
+        self.assertIn("Today the CLI supports `project`, `plan`, and `status`.", shared)
+
+    def test_readmes_document_project_init_and_codebase_rewrite_step(self) -> None:
+        root_readme = read_text(REPO_ROOT / "README.md")
+        planr_readme = read_text(REPO_ROOT / ".planr" / "README.md")
+
+        self.assertIn("python3 .planr/tooling/planr.py project init", root_readme)
+        self.assertIn("rewrite `.planr/project/*.md`", root_readme)
+        self.assertIn("python3 .planr/tooling/planr.py project init", planr_readme)
+        self.assertIn("inspect the target codebase and rewrite `.planr/project/*.md`", planr_readme)
 
     def test_missing_checklist_content_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

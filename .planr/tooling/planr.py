@@ -14,12 +14,287 @@ from typing import Any, Iterable
 
 STATUS_FILE = Path(".planr/status/current.json")
 PLANS_DIR = Path(".planr/plans")
+PROJECT_DIR = Path(".planr/project")
 VALID_SCOPE_STATUSES = {"pending", "in_progress", "completed", "blocked", "cancelled"}
 VALID_CHECKLIST_STATUSES = VALID_SCOPE_STATUSES
 VALID_BLOCKER_STATUSES = {"blocked", "unverified"}
 VALID_VERIFICATION_STATUSES = {"passed", "failed", "blocked", "not_run"}
 OPEN_SCOPE_STATUSES = {"pending", "in_progress", "blocked"}
 NON_PASSED_VERIFICATION_STATUSES = VALID_VERIFICATION_STATUSES - {"passed"}
+PROJECT_FILE_ORDER = [
+    "product.md",
+    "ownership.md",
+    "flows.md",
+    "state-ssot.md",
+    "constraints.md",
+    "quality-gates.md",
+]
+PROJECT_INIT_NEXT_STEP = (
+    "Inspect the target codebase and rewrite `.planr/project/*.md` to match the repo's actual product, "
+    "ownership boundaries, flows, state sources of truth, and quality gates before trusting architecture "
+    "or ownership decisions."
+)
+DEFAULT_STATUS_NOTES = [
+    "`.planr/status/current.json` is the live summary for this repo. Execution contracts live in `.planr/plans/*.plan.md`.",
+    "Run `python3 .planr/tooling/planr.py project init`, then inspect and rewrite `.planr/project/*.md` for the target repo before trusting ownership or architecture decisions.",
+]
+PROJECT_TEMPLATE_TEXTS = {
+    "product.md": """# Product
+
+Durable product context for planr-style planning in **this** repository.
+
+Fill this in for the codebase you install these skills into:
+
+- what the software is
+- what “good” looks like for users or consumers
+- what outcomes count as improvement
+
+## Product Summary
+
+*(Replace with your project: e.g. a library, CLI, service, or app.)*
+
+## Core Goal
+
+Help contributors and agents work with:
+
+- clear scope and owned paths
+- explicit plans and verification
+- honest status in `.planr/status/current.json`
+
+## Non-Goals
+
+Avoid optimizing for vague scope, unchecked plan boxes without proof, or duplicate canonical workflows for the same task.
+
+## Source Material
+
+Prefer linking to this repo’s `README.md`, `CONTRIBUTING.md`, or architecture docs when they exist.
+""",
+    "ownership.md": """# Ownership
+
+Define **your** codebase’s layers so `planr-plan` / `planr-review` can place work correctly.
+
+Replace the placeholders below with real paths (examples: `src/`, `packages/foo/`, `internal/`, `cmd/`).
+
+## Suggested layers (customize)
+
+| Layer | Path pattern | Owns |
+|-------|----------------|------|
+| Entry / UI | *(e.g. `apps/web/`, `cli/`) | User-facing surface, presentation |
+| Application / API | *(e.g. `server/`, `api/`) | Use-cases, orchestration |
+| Domain / core | *(e.g. `lib/`, `domain/`) | Shared rules, types, pure logic |
+| Integrations | *(e.g. `adapters/`, `integrations/`) | External systems, not global product policy |
+
+## Ownership rules
+
+- **Runtime owner**: where the behavior runs today.
+- **First-fix owner**: where the bug or duplication lives now.
+- **Canonical owner**: where the logic should live after cleanup.
+
+Do not collapse these into one vague answer.
+
+## Wrong defaults (typical smells)
+
+- UI owning durable server-side truth
+- Thin transport layers owning domain policy
+- Duplicated rules across packages without a single SSOT
+
+## Source material
+
+Update from your repo’s architecture or CONTRIBUTING docs when available.
+""",
+    "flows.md": """# Flows
+
+High-level flows planning work should respect. Adapt examples to **your** stack (web, CLI, mobile, backend, etc.).
+
+## Change flow
+
+1. User or ticket defines scope.
+2. Read `.planr/project/` context when architecture matters.
+3. Add or update a scoped plan under `.planr/plans/*.plan.md` when the work needs a contract.
+4. Implement against owned paths only.
+5. Record verification and update `.planr/status/current.json` when tracking execution.
+
+## Plan → execute → verify
+
+- **Plan**: explicit scope, ownership, phases, acceptance criteria.
+- **Fix**: concrete changes + tests/docs.
+- **Review**: Git-scoped evidence that the contract is satisfied.
+
+## Status vs review vs fix
+
+- **Status**: smallest honest verdict right now.
+- **Review**: did the implementation satisfy the task correctly?
+- **Fix**: what concrete work closes the gap?
+
+Do not merge these flows silently.
+
+## Boundaries
+
+Prefer one canonical path per concern, explicit handoffs between layers, and a single owner per policy decision.
+
+## Source material
+
+Derive from your repo’s docs (e.g. architecture overview, ADRs) when present.
+""",
+    "state-ssot.md": """# State SSOT
+
+Default expectations for **where truth lives** in this repo. Customize for your persistence and UI model.
+
+## Principles
+
+- Persisted or authoritative state has one canonical owner; UI mirrors derive from it.
+- Feature-local UI state stays near the feature.
+- Derived state is recomputed from SSOT, not duplicated with fragile sync.
+
+## Planning questions
+
+Before state changes, answer:
+
+- What is the current source of truth?
+- What competing source should be removed or narrowed?
+- Which layer should derive instead of store?
+
+## Anti-patterns
+
+- Two parallel owners for the same rule
+- “Helpful” fallbacks in transport that become the real behavior
+- Dead config or schema fields that no longer affect behavior
+
+## Source material
+
+Align with your repo’s data model and API contracts when documented.
+""",
+    "constraints.md": """# Constraints
+
+This file captures non-negotiable planning and implementation constraints for planr workflows.
+
+## Hard-Cut Product Policy
+
+Default stance:
+
+- keep one canonical current-state implementation
+- delete or narrow fallback, compatibility, shim, bridge, adapter, and dual-path behavior when the task calls for a hard cut
+- when only one meaningful current-state behavior remains, delete the surrounding concept end-to-end instead of preserving a one-value enum, one-option selector, dead config key, or pass-through field
+- prefer fail-fast diagnostics and explicit recovery steps
+- use invalid-state diagnostics only on boundaries that still legitimately exist; do not keep deleted concepts around solely to reject their former values
+
+Do not introduce migration glue or second current-state paths unless the user explicitly asks for transition support.
+
+## Scope Discipline
+
+- keep owned scope explicit
+- do not silently widen into adjacent cleanup
+- do not treat unrelated dirty files as part of the task
+- if mixed authorship makes scope ambiguous, stop and clarify
+
+## Owner Discipline
+
+- thin shells stay thin
+- reusable policy should not get stranded in transport or glue layers
+- integration modules own external wiring, not global domain policy
+- UI-only state should not become the SSOT for server or shared domain truth
+
+## Fresh-Repo Bootstrap Rule
+
+If a repo does not already have equivalent durable context for:
+
+- product direction
+- ownership boundaries
+- critical flows
+- state ownership
+- quality gates
+
+then `planr-plan` must create or request the `.planr/project/` pack before making strong architecture or ownership decisions.
+
+## Documentation Bias
+
+Prefer:
+
+- durable repo-local docs
+- explicit contracts
+- explicit verification notes
+
+over:
+
+- ephemeral chat context
+- implied assumptions
+- checklist-only claims
+
+## Source Material
+
+Align with repo policy docs (e.g. `AGENTS.md`, contributing guides, or a local “hard cut / no dual paths” rule) when present.
+""",
+    "quality-gates.md": """# Quality Gates
+
+This file defines the minimum bar for claiming progress or completion in planr workflows.
+
+## Completion Contract
+
+Do not report success until every requested item is:
+
+- completed
+- explicitly blocked
+- or explicitly unverified
+
+Status files and plan todos are summary state, not proof.
+
+## Verification Rules
+
+- run the smallest relevant verification first
+- record the exact command and actual result
+- if a broader command is blocked by unrelated failures, say so explicitly
+- do not convert blocked or skipped verification into a silent pass
+
+## Evidence Rules
+
+Strong evidence includes:
+
+- exact test or verification commands
+- exact pass, fail, blocked, or unverified results
+- scoped diff evidence
+- exact path-scoped Git comparison commands for review verdicts
+- searches that prove the competing path is gone
+- for hard-cut removals, proof that the dead concept itself is gone from live contracts and owner layers, not only that an old value is rejected
+
+Weak evidence includes:
+
+- checked boxes without proof
+- "looks done"
+- one nearby happy-path test
+- large diffs without scoped verification
+- a review verdict without an exact path-scoped Git comparison command
+- a reject-test for a deleted legacy value when the surrounding one-value setting, enum, or binding still exists
+
+## Default Validation Commands
+
+Use the smallest affected scope first, then broaden when warranted.
+
+Customize this section for the target repository. Good defaults are:
+
+- the smallest relevant unit or integration test command for the owned scope
+- the narrowest typecheck, compile, or build command that validates the changed surface
+- the repo's linter or static-analysis command for the affected package, module, or file set
+- the repo's format check when formatting is part of the gate
+- a targeted smoke check or manual repro command when the change is user-visible or operational
+
+Record the exact commands and outcomes in the plan, status, or review artifact instead of assuming another repo's stack.
+
+## Status Tracking Rules
+
+- `.planr/status/current.json` is the canonical live planr status source
+- `.planr/plans/*.plan.md` contains scoped execution contracts
+- material persisted reviews may live under `.planr/review/*.review.md`, but `current.json` remains the summary layer rather than a duplicate full review log
+- after each substantial step, update the live status source honestly
+- after interruption or resume, read `.planr/status/current.json` and `git status` before continuing
+
+## Source Material
+
+This file is derived from:
+
+- `AGENTS.md`
+- repo user rules for test execution
+""",
+}
 
 
 class CliError(RuntimeError):
@@ -95,6 +370,24 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 def write_json(path: Path, data: Any) -> None:
     atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def canonical_project_context_files() -> list[str]:
+    return [f"{PROJECT_DIR.as_posix()}/{name}" for name in PROJECT_FILE_ORDER]
+
+
+def default_status_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "updated_at": utc_timestamp(),
+        "global_status": "open",
+        "project_context": {
+            "root": PROJECT_DIR.as_posix(),
+            "files": canonical_project_context_files(),
+        },
+        "notes": list(DEFAULT_STATUS_NOTES),
+        "scopes": [],
+    }
 
 
 def normalize_unique_paths(root: Path, values: Iterable[str] | None) -> list[str]:
@@ -337,6 +630,53 @@ def cmd_plan_new(args: argparse.Namespace, root: Path) -> int:
     return 0
 
 
+def cmd_project_init(args: argparse.Namespace, root: Path) -> int:
+    project_root = root / PROJECT_DIR
+    project_root.mkdir(parents=True, exist_ok=True)
+    (root / PLANS_DIR).mkdir(parents=True, exist_ok=True)
+    (root / STATUS_FILE.parent).mkdir(parents=True, exist_ok=True)
+
+    written: list[str] = []
+    preserved_existing: list[str] = []
+
+    for filename in PROJECT_FILE_ORDER:
+        path = project_root / filename
+        content = PROJECT_TEMPLATE_TEXTS[filename]
+        relative_path = path.relative_to(root).as_posix()
+        if path.exists() and not args.force:
+            existing = path.read_text(encoding="utf-8")
+            if existing != content:
+                preserved_existing.append(relative_path)
+                continue
+        atomic_write_text(path, content)
+        written.append(relative_path)
+
+    status_path = get_status_path(root)
+    if status_path.exists():
+        data = read_json(status_path)
+        if not isinstance(data, dict):
+            raise CliError(f"Invalid status payload in {status_path}")
+    else:
+        data = default_status_payload()
+
+    data["project_context"] = {
+        "root": PROJECT_DIR.as_posix(),
+        "files": canonical_project_context_files(),
+    }
+    save_status(root, data)
+
+    payload = {
+        "project_root": PROJECT_DIR.as_posix(),
+        "written": written,
+        "preserved_existing": preserved_existing,
+        "project_context_files": canonical_project_context_files(),
+        "status_path": STATUS_FILE.as_posix(),
+        "next_step": PROJECT_INIT_NEXT_STEP,
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_status_show(args: argparse.Namespace, root: Path) -> int:
     data = load_status(root)
     if args.scope:
@@ -570,6 +910,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Deterministic local helper CLI for `.planr` plan and status files.")
     parser.add_argument("--repo-root", help="Repo root containing `.planr/`. Defaults to the current repo root.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    project_parser = subparsers.add_parser("project", help="Deterministic `.planr/project` helpers.")
+    project_subparsers = project_parser.add_subparsers(dest="project_command", required=True)
+
+    project_init = project_subparsers.add_parser(
+        "init",
+        help="Create or refresh the `.planr/project` starter pack and canonical project-context metadata.",
+    )
+    project_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing `.planr/project/*.md` files instead of preserving customized content.",
+    )
+    project_init.set_defaults(func=cmd_project_init)
 
     plan_parser = subparsers.add_parser("plan", help="Deterministic `.planr/plans` helpers.")
     plan_subparsers = plan_parser.add_subparsers(dest="plan_command", required=True)
