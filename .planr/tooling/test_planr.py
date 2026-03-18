@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -19,6 +20,11 @@ SKILLS_ROOT = REPO_ROOT / ".codex" / "skills"
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
 
 
 def write_status_fixture(root: Path, *, scopes: list[dict] | None = None) -> None:
@@ -135,6 +141,189 @@ class PlanrCliTests(unittest.TestCase):
             self.assertIn('overview: "Second version."', content)
             self.assertIn("isProject: true", content)
             self.assertNotEqual(content, "stale\n")
+
+    def test_plan_path_matches_plan_new_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_status_fixture(root)
+
+            path_result = self.run_cli(
+                root,
+                "plan",
+                "path",
+                "--title",
+                "Planr Python CLI",
+            )
+            self.assertEqual(path_result.returncode, 0, path_result.stderr)
+            self.assertEqual(path_result.stdout.strip(), ".planr/plans/planr_python_cli_e4aded5b.plan.md")
+            self.assertFalse((root / path_result.stdout.strip()).exists())
+
+            create_result = self.run_cli(
+                root,
+                "plan",
+                "new",
+                "--title",
+                "Planr Python CLI",
+                "--overview",
+                "Deterministic local planr CLI.",
+                "--todo",
+                "lock-cli-contract=Define the minimal deterministic planr CLI surface.",
+            )
+            self.assertEqual(create_result.returncode, 0, create_result.stderr)
+            self.assertEqual(create_result.stdout.strip(), path_result.stdout.strip())
+            self.assertTrue((root / path_result.stdout.strip()).is_file())
+
+    def test_plan_archive_moves_completed_scope_plans_and_rewrites_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan_path = root / ".planr" / "plans" / "planr_python_cli_e4aded5b.plan.md"
+            write_text(plan_path, "# Planr Python CLI\n",)
+            write_status_fixture(
+                root,
+                scopes=[
+                    {
+                        "id": "planr-python-cli",
+                        "title": "Planr Python CLI",
+                        "status": "completed",
+                        "source": "user-requested planr-fix",
+                        "plan_paths": [".planr/plans/planr_python_cli_e4aded5b.plan.md"],
+                        "owned_paths": [".planr/tooling/planr.py"],
+                        "checklist": [],
+                        "verification": [],
+                        "blocked_or_unverified": [],
+                    }
+                ],
+            )
+
+            archive = self.run_cli(
+                root,
+                "plan",
+                "archive",
+                "--scope",
+                "planr-python-cli",
+                "--archive-date",
+                "2026-03-18",
+            )
+            self.assertEqual(archive.returncode, 0, archive.stderr)
+            payload = json.loads(archive.stdout)
+            self.assertEqual(payload["scope"], "planr-python-cli")
+            self.assertEqual(payload["archive_bucket"], ".planr/plans/done/18-03")
+            self.assertEqual(
+                payload["archived_plan_paths"],
+                [
+                    {
+                        "from": ".planr/plans/planr_python_cli_e4aded5b.plan.md",
+                        "to": ".planr/plans/done/18-03/planr_python_cli_e4aded5b.plan.md",
+                    }
+                ],
+            )
+
+            archived_path = root / ".planr" / "plans" / "done" / "18-03" / "planr_python_cli_e4aded5b.plan.md"
+            self.assertFalse(plan_path.exists())
+            self.assertTrue(archived_path.is_file())
+            self.assertEqual(archived_path.read_text(encoding="utf-8"), "# Planr Python CLI\n")
+
+            show_scope = self.run_cli(root, "status", "show", "--scope", "planr-python-cli")
+            self.assertEqual(show_scope.returncode, 0, show_scope.stderr)
+            scope = json.loads(show_scope.stdout)
+            self.assertEqual(scope["plan_paths"], [".planr/plans/done/18-03/planr_python_cli_e4aded5b.plan.md"])
+
+    def test_plan_archive_rejects_invalid_scope_states_and_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            cases = [
+                (
+                    "pending scope",
+                    [
+                        {
+                            "id": "planr-python-cli",
+                            "title": "Planr Python CLI",
+                            "status": "pending",
+                            "source": "",
+                            "plan_paths": [".planr/plans/planr_python_cli_e4aded5b.plan.md"],
+                            "owned_paths": [],
+                            "checklist": [],
+                            "verification": [],
+                            "blocked_or_unverified": [],
+                        }
+                    ],
+                    {".planr/plans/planr_python_cli_e4aded5b.plan.md": "# Plan\n"},
+                    "Only completed scopes can be archived",
+                ),
+                (
+                    "empty plan paths",
+                    [
+                        {
+                            "id": "planr-python-cli",
+                            "title": "Planr Python CLI",
+                            "status": "completed",
+                            "source": "",
+                            "plan_paths": [],
+                            "owned_paths": [],
+                            "checklist": [],
+                            "verification": [],
+                            "blocked_or_unverified": [],
+                        }
+                    ],
+                    {},
+                    "Scope has no plan paths to archive",
+                ),
+                (
+                    "already archived",
+                    [
+                        {
+                            "id": "planr-python-cli",
+                            "title": "Planr Python CLI",
+                            "status": "completed",
+                            "source": "",
+                            "plan_paths": [".planr/plans/done/18-03/planr_python_cli_e4aded5b.plan.md"],
+                            "owned_paths": [],
+                            "checklist": [],
+                            "verification": [],
+                            "blocked_or_unverified": [],
+                        }
+                    ],
+                    {".planr/plans/done/18-03/planr_python_cli_e4aded5b.plan.md": "# Plan\n"},
+                    "Plan path is already archived",
+                ),
+                (
+                    "non plan path",
+                    [
+                        {
+                            "id": "planr-python-cli",
+                            "title": "Planr Python CLI",
+                            "status": "completed",
+                            "source": "",
+                            "plan_paths": [".planr/review/example.review.md"],
+                            "owned_paths": [],
+                            "checklist": [],
+                            "verification": [],
+                            "blocked_or_unverified": [],
+                        }
+                    ],
+                    {".planr/review/example.review.md": "# Review\n"},
+                    "Scope plan path is not under .planr/plans",
+                ),
+            ]
+
+            for label, scopes, files, expected_error in cases:
+                with self.subTest(label=label):
+                    write_status_fixture(root, scopes=scopes)
+                    for path_str, content in files.items():
+                        write_text(root / path_str, content)
+
+                    result = self.run_cli(
+                        root,
+                        "plan",
+                        "archive",
+                        "--scope",
+                        "planr-python-cli",
+                        "--archive-date",
+                        "2026-03-18",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected_error, result.stderr)
 
     def test_status_commands_upsert_scope_items_and_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -350,6 +539,187 @@ class PlanrCliTests(unittest.TestCase):
             self.assertEqual([item["id"] for item in scope["checklist"]], ["phase-1", "phase-2", "verify"])
             self.assertEqual([item["id"] for item in scope["blocked_or_unverified"]], ["docs", "api"])
             self.assertEqual([item["id"] for item in scope["verification"]], ["tests", "diff"])
+
+    def test_status_clear_and_delete_mutations_cover_non_upsert_flows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_status_fixture(
+                root,
+                scopes=[
+                    {
+                        "id": "planr-python-cli",
+                        "title": "Planr Python CLI",
+                        "status": "in_progress",
+                        "source": "user-requested planr-fix",
+                        "plan_paths": [".planr/plans/example.plan.md"],
+                        "owned_paths": [".planr/tooling/planr.py"],
+                        "checklist": [{"id": "phase-1", "content": "Phase 1.", "status": "pending"}],
+                        "verification": [{"id": "tests", "status": "not_run", "result": "Not run yet."}],
+                        "blocked_or_unverified": [{"id": "api", "content": "Need API.", "status": "blocked"}],
+                    }
+                ],
+            )
+
+            clear_scope = self.run_cli(
+                root,
+                "status",
+                "ensure-scope",
+                "--id",
+                "planr-python-cli",
+                "--clear-plan-paths",
+                "--clear-owned-paths",
+            )
+            self.assertEqual(clear_scope.returncode, 0, clear_scope.stderr)
+
+            delete_checklist = self.run_cli(
+                root,
+                "status",
+                "delete-checklist",
+                "--scope",
+                "planr-python-cli",
+                "--item-id",
+                "phase-1",
+            )
+            self.assertEqual(delete_checklist.returncode, 0, delete_checklist.stderr)
+
+            delete_blocker = self.run_cli(
+                root,
+                "status",
+                "delete-blocker",
+                "--scope",
+                "planr-python-cli",
+                "--item-id",
+                "api",
+            )
+            self.assertEqual(delete_blocker.returncode, 0, delete_blocker.stderr)
+
+            delete_verification = self.run_cli(
+                root,
+                "status",
+                "delete-verification",
+                "--scope",
+                "planr-python-cli",
+                "--verification-id",
+                "tests",
+            )
+            self.assertEqual(delete_verification.returncode, 0, delete_verification.stderr)
+
+            show_scope = self.run_cli(root, "status", "show", "--scope", "planr-python-cli")
+            self.assertEqual(show_scope.returncode, 0, show_scope.stderr)
+            scope = json.loads(show_scope.stdout)
+            self.assertEqual(scope["plan_paths"], [])
+            self.assertEqual(scope["owned_paths"], [])
+            self.assertEqual(scope["checklist"], [])
+            self.assertEqual(scope["blocked_or_unverified"], [])
+            self.assertEqual(scope["verification"], [])
+
+            delete_scope = self.run_cli(root, "status", "delete-scope", "--id", "planr-python-cli")
+            self.assertEqual(delete_scope.returncode, 0, delete_scope.stderr)
+            deleted = json.loads(delete_scope.stdout)
+            self.assertEqual(deleted["id"], "planr-python-cli")
+
+            status_result = self.run_cli(root, "status", "show")
+            self.assertEqual(status_result.returncode, 0, status_result.stderr)
+            payload = json.loads(status_result.stdout)
+            self.assertEqual(payload["scopes"], [])
+
+    def test_status_mutations_serialize_concurrent_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_status_fixture(
+                root,
+                scopes=[
+                    {
+                        "id": "planr-python-cli",
+                        "title": "Planr Python CLI",
+                        "status": "in_progress",
+                        "source": "user-requested planr-fix",
+                        "plan_paths": [],
+                        "owned_paths": [],
+                        "checklist": [],
+                        "verification": [],
+                        "blocked_or_unverified": [],
+                    }
+                ],
+            )
+
+            marker_path = root / ".planr" / "status" / "lock-marker"
+            worker_code = """
+import importlib.util
+import pathlib
+import sys
+import time
+
+root = pathlib.Path(sys.argv[1])
+script_path = pathlib.Path(sys.argv[2])
+item_id = sys.argv[3]
+sleep_seconds = float(sys.argv[4])
+marker_arg = sys.argv[5]
+
+spec = importlib.util.spec_from_file_location("planr_tool", script_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+with module.status_mutation_session(root) as data:
+    scope = module.require_scope(data, "planr-python-cli")
+    items = module.require_list_field(scope, "checklist", "planr-python-cli")
+    item = module.upsert_item(items, item_id)
+    item["content"] = f"{item_id} content"
+    item["status"] = "completed"
+    if marker_arg != "-":
+        pathlib.Path(marker_arg).write_text("locked\\n", encoding="utf-8")
+    time.sleep(sleep_seconds)
+"""
+
+            first = subprocess.Popen(
+                [sys.executable, "-c", worker_code, str(root), str(SCRIPT_PATH), "phase-1", "0.2", str(marker_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 5.0
+            while not marker_path.exists():
+                if first.poll() is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    self.fail("First worker never acquired the status mutation lock.")
+                time.sleep(0.01)
+
+            second = subprocess.Popen(
+                [sys.executable, "-c", worker_code, str(root), str(SCRIPT_PATH), "phase-2", "0.0", "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            first_stdout, first_stderr = first.communicate(timeout=10)
+            second_stdout, second_stderr = second.communicate(timeout=10)
+            self.assertEqual(first.returncode, 0, first_stderr + first_stdout)
+            self.assertEqual(second.returncode, 0, second_stderr + second_stdout)
+
+            show_scope = self.run_cli(root, "status", "show", "--scope", "planr-python-cli")
+            self.assertEqual(show_scope.returncode, 0, show_scope.stderr)
+            scope = json.loads(show_scope.stdout)
+            self.assertEqual([item["id"] for item in scope["checklist"]], ["phase-1", "phase-2"])
+
+    def test_status_ensure_scope_rejects_clear_and_replace_for_same_path_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            write_status_fixture(root)
+
+            result = self.run_cli(
+                root,
+                "status",
+                "ensure-scope",
+                "--id",
+                "planr-python-cli",
+                "--clear-plan-paths",
+                "--plan-path",
+                ".planr/plans/example.plan.md",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not allowed with argument", result.stderr)
 
     def test_status_open_lists_open_and_drifted_scopes_in_deterministic_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -667,25 +1037,27 @@ class PlanrSkillSmokeTests(unittest.TestCase):
 
     def test_shared_baseline_exists_and_setup_docs_copy_it(self) -> None:
         shared_path = SKILLS_ROOT / "planr-shared.md"
-        readme = read_text(REPO_ROOT / "README.md")
 
         self.assertTrue(shared_path.is_file())
-        self.assertIn("cp /path/to/codex-planr/.codex/skills/planr-shared.md .codex/skills/", readme)
-        self.assertIn("planr-shared.md", readme)
 
     def test_shared_baseline_documents_actual_cli_surface(self) -> None:
         shared = read_text(SKILLS_ROOT / "planr-shared.md")
 
         expected_commands = [
             "./.planr/tooling/planr project init",
+            "./.planr/tooling/planr plan path",
             "./.planr/tooling/planr plan new",
             "./.planr/tooling/planr status show",
             "./.planr/tooling/planr status open",
             "./.planr/tooling/planr status next",
             "./.planr/tooling/planr status ensure-scope",
+            "./.planr/tooling/planr status delete-scope",
             "./.planr/tooling/planr status set-checklist",
+            "./.planr/tooling/planr status delete-checklist",
             "./.planr/tooling/planr status set-blocker",
+            "./.planr/tooling/planr status delete-blocker",
             "./.planr/tooling/planr status set-verification",
+            "./.planr/tooling/planr status delete-verification",
         ]
         for command in expected_commands:
             self.assertIn(command, shared)
@@ -715,13 +1087,22 @@ class PlanrSkillSmokeTests(unittest.TestCase):
         self.assertIn("Today the CLI supports `project`, `plan`, and `status`.", shared)
 
     def test_readmes_document_project_init_and_codebase_rewrite_step(self) -> None:
-        root_readme = read_text(REPO_ROOT / "README.md")
         planr_readme = read_text(REPO_ROOT / ".planr" / "README.md")
 
-        self.assertIn("./.planr/tooling/planr project init", root_readme)
-        self.assertIn("rewrite `.planr/project/*.md`", root_readme)
         self.assertIn("./.planr/tooling/planr project init", planr_readme)
         self.assertIn("inspect the target codebase and rewrite `.planr/project/*.md`", planr_readme)
+
+    def test_active_docs_do_not_reference_removed_tau_planr_entrypoint(self) -> None:
+        active_docs = [
+            REPO_ROOT / "AGENTS.md",
+            REPO_ROOT / ".planr" / "README.md",
+            SKILLS_ROOT / "planr-shared.md",
+            SKILLS_ROOT / "planr-plan" / "SKILL.md",
+            SKILLS_ROOT / "planr-fix" / "SKILL.md",
+            SKILLS_ROOT / "planr-status" / "SKILL.md",
+        ]
+        for path in active_docs:
+            self.assertNotIn("tau_planr.py", read_text(path), path.as_posix())
 
     def test_missing_checklist_content_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

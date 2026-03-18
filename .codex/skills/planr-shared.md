@@ -7,6 +7,8 @@ Use this with any repo-local `planr-*` skill.
 - Prefer `./.planr/tooling/planr` whenever its command surface fits the task.
 - The wrapper prefers `python3` and falls back to `python` when `python` is Python 3.
 - Do not hand-edit `.planr/status/current.json` or scaffold a new `.planr/plans/*.plan.md` file by hand when the CLI already covers that operation.
+- Status mutations are single-writer serialized through the shared CLI; do not bypass it with parallel hand-edits to `.planr/status/current.json`.
+- Do not invent ascending plan ids. When a completed scope needs plan-folder hygiene, archive it through the shared CLI into `.planr/plans/done/DD-MM/`.
 - Do not invent unsupported `planr.py` subcommands. Today the CLI supports `project`, `plan`, and `status`.
 
 ## Current CLI Surface
@@ -16,16 +18,22 @@ Use these commands as the deterministic first path:
 ```bash
 ./.planr/tooling/planr project init [--force]
 
+./.planr/tooling/planr plan path --title "..." [--slug slug]
 ./.planr/tooling/planr plan new --title "..." --overview "..." [--todo id=content] [--slug slug] [--project]
+./.planr/tooling/planr plan archive --scope scope-id [--archive-date YYYY-MM-DD]
 
 ./.planr/tooling/planr status show [--scope scope-id]
 ./.planr/tooling/planr status open
 ./.planr/tooling/planr status next
 
-./.planr/tooling/planr status ensure-scope --id scope-id [--title "..."] [--status pending|in_progress|blocked|completed|cancelled] [--source "..."] [--plan-path path] [--owned-path path]
+./.planr/tooling/planr status ensure-scope --id scope-id [--title "..."] [--status pending|in_progress|blocked|completed|cancelled] [--source "..."] [--clear-plan-paths] [--plan-path path] [--clear-owned-paths] [--owned-path path]
+./.planr/tooling/planr status delete-scope --id scope-id
 ./.planr/tooling/planr status set-checklist --scope scope-id --item-id item-id --content "..." --status pending|in_progress|blocked|completed|cancelled
+./.planr/tooling/planr status delete-checklist --scope scope-id --item-id item-id
 ./.planr/tooling/planr status set-blocker --scope scope-id --item-id item-id --content "..." --status blocked|unverified
+./.planr/tooling/planr status delete-blocker --scope scope-id --item-id item-id
 ./.planr/tooling/planr status set-verification --scope scope-id --verification-id verification-id --status not_run|passed|failed|blocked --result "..." [--command "..."]
+./.planr/tooling/planr status delete-verification --scope scope-id --verification-id verification-id
 ```
 
 ## What Each Source Means

@@ -2,19 +2,26 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import sys
 import tempfile
+import time
 import unicodedata
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 STATUS_FILE = Path(".planr/status/current.json")
 PLANS_DIR = Path(".planr/plans")
+DONE_PLANS_DIR = PLANS_DIR / "done"
 PROJECT_DIR = Path(".planr/project")
+STATUS_LOCK_TIMEOUT_SECONDS = 10.0
+STATUS_LOCK_POLL_INTERVAL_SECONDS = 0.05
 VALID_SCOPE_STATUSES = {"pending", "in_progress", "completed", "blocked", "cancelled"}
 VALID_CHECKLIST_STATUSES = VALID_SCOPE_STATUSES
 VALID_BLOCKER_STATUSES = {"blocked", "unverified"}
@@ -326,6 +333,42 @@ def title_hash(title: str) -> str:
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
 
 
+def plan_filename(title: str, slug: str | None = None) -> str:
+    effective_slug = slugify(slug or title)
+    return f"{effective_slug}_{title_hash(title)}.plan.md"
+
+
+def plan_relative_path(title: str, slug: str | None = None) -> str:
+    return (PLANS_DIR / plan_filename(title, slug)).as_posix()
+
+
+def parse_archive_date(raw_value: str) -> date:
+    try:
+        return datetime.strptime(raw_value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise CliError("`--archive-date` must use the form YYYY-MM-DD.") from exc
+
+
+def archive_bucket_relative_path(archive_date: date) -> str:
+    return (DONE_PLANS_DIR / archive_date.strftime("%d-%m")).as_posix()
+
+
+def path_is_within_prefix(raw_path: str, prefix: Path) -> bool:
+    path_parts = Path(raw_path).parts
+    prefix_parts = prefix.parts
+    return len(path_parts) >= len(prefix_parts) and path_parts[: len(prefix_parts)] == prefix_parts
+
+
+def require_string_list_field(parent: dict[str, Any], key: str, owner: str) -> list[str]:
+    items = get_list_field(parent, key, owner)
+    strings: list[str] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, str) or not item.strip():
+            raise CliError(f"`{owner}.{key}[{index}]` must be a non-empty string in `.planr/status/current.json`.")
+        strings.append(item.strip())
+    return strings
+
+
 def resolve_repo_root(repo_root: str | None) -> Path:
     if repo_root:
         root = Path(repo_root).expanduser().resolve()
@@ -401,6 +444,11 @@ def get_status_path(root: Path) -> Path:
     return root / STATUS_FILE
 
 
+def get_status_lock_path(root: Path) -> Path:
+    status_path = get_status_path(root)
+    return status_path.with_name(f"{status_path.name}.lock")
+
+
 def load_status(root: Path) -> dict[str, Any]:
     return read_json(get_status_path(root))
 
@@ -408,6 +456,42 @@ def load_status(root: Path) -> dict[str, Any]:
 def save_status(root: Path, data: dict[str, Any]) -> None:
     data["updated_at"] = utc_timestamp()
     write_json(get_status_path(root), data)
+
+
+@contextmanager
+def status_write_lock(root: Path) -> Iterator[None]:
+    lock_path = get_status_lock_path(root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + STATUS_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise CliError(f"Could not acquire status write lock: {lock_path.relative_to(root).as_posix()}") from exc
+                if time.monotonic() >= deadline:
+                    raise CliError(f"Timed out waiting for status write lock: {lock_path.relative_to(root).as_posix()}")
+                time.sleep(STATUS_LOCK_POLL_INTERVAL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def status_mutation_session(root: Path) -> Iterator[dict[str, Any]]:
+    with status_write_lock(root):
+        status_path = get_status_path(root)
+        if status_path.exists():
+            data = load_status(root)
+            if not isinstance(data, dict):
+                raise CliError(f"Invalid status payload in {status_path}")
+        else:
+            data = default_status_payload()
+        yield data
+        save_status(root, data)
 
 
 def scopes(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -451,6 +535,13 @@ def find_scope(data: dict[str, Any], scope_id: str) -> dict[str, Any] | None:
     for scope in scopes(data):
         if scope.get("id") == scope_id:
             return scope
+    return None
+
+
+def find_scope_index(data: dict[str, Any], scope_id: str) -> int | None:
+    for index, scope in enumerate(scopes(data)):
+        if scope.get("id") == scope_id:
+            return index
     return None
 
 
@@ -504,6 +595,13 @@ def upsert_item(
 
     items.insert(existing_index, item)
     return item
+
+
+def delete_item(items: list[dict[str, Any]], item_id: str, label: str) -> dict[str, Any]:
+    index = find_item_index(items, item_id)
+    if index is None:
+        raise CliError(f"{label} not found: {item_id}")
+    return items.pop(index)
 
 
 def yaml_quoted(value: str) -> str:
@@ -609,6 +707,73 @@ def parse_todos(raw_todos: list[str]) -> list[tuple[str, str]]:
     return todos
 
 
+def archive_scope_plan_paths(root: Path, *, scope_id: str, archive_date: date) -> dict[str, Any]:
+    bucket_relative_path = archive_bucket_relative_path(archive_date)
+    moved_paths: list[tuple[Path, Path]] = []
+
+    with status_write_lock(root):
+        status_path = get_status_path(root)
+        data = load_status(root) if status_path.exists() else default_status_payload()
+        if not isinstance(data, dict):
+            raise CliError(f"Invalid status payload in {status_path}")
+
+        scope = require_scope(data, scope_id)
+        scope_status = require_valid_status(scope.get("status"), VALID_SCOPE_STATUSES, f"`{scope_id}.status`")
+        if scope_status != "completed":
+            raise CliError(f"Only completed scopes can be archived: {scope_id}")
+
+        plan_paths = require_string_list_field(scope, "plan_paths", scope_id)
+        if not plan_paths:
+            raise CliError(f"Scope has no plan paths to archive: {scope_id}")
+
+        seen_destinations: set[str] = set()
+        move_specs: list[tuple[str, Path, str, Path]] = []
+        for plan_path in plan_paths:
+            if path_is_within_prefix(plan_path, DONE_PLANS_DIR):
+                raise CliError(f"Plan path is already archived: {plan_path}")
+            if not path_is_within_prefix(plan_path, PLANS_DIR):
+                raise CliError(f"Scope plan path is not under {PLANS_DIR.as_posix()}: {plan_path}")
+
+            source_path = root / plan_path
+            if not source_path.is_file():
+                raise CliError(f"Plan file not found: {plan_path}")
+
+            destination_relative_path = f"{bucket_relative_path}/{source_path.name}"
+            if destination_relative_path in seen_destinations:
+                raise CliError(f"Archive destination collision: {destination_relative_path}")
+            seen_destinations.add(destination_relative_path)
+
+            destination_path = root / destination_relative_path
+            if destination_path.exists():
+                raise CliError(f"Archive destination already exists: {destination_relative_path}")
+
+            move_specs.append((plan_path, source_path, destination_relative_path, destination_path))
+
+        try:
+            for _, source_path, _, destination_path in move_specs:
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                source_path.replace(destination_path)
+                moved_paths.append((source_path, destination_path))
+
+            scope["plan_paths"] = [destination_relative_path for _, _, destination_relative_path, _ in move_specs]
+            save_status(root, data)
+        except Exception:
+            for original_path, archived_path in reversed(moved_paths):
+                if archived_path.exists() and not original_path.exists():
+                    original_path.parent.mkdir(parents=True, exist_ok=True)
+                    archived_path.replace(original_path)
+            raise
+
+    return {
+        "scope": scope_id,
+        "archive_bucket": bucket_relative_path,
+        "archived_plan_paths": [
+            {"from": source_relative_path, "to": destination_relative_path}
+            for source_relative_path, _, destination_relative_path, _ in move_specs
+        ],
+    }
+
+
 def cmd_plan_new(args: argparse.Namespace, root: Path) -> int:
     title = args.title.strip()
     if not title:
@@ -618,15 +783,29 @@ def cmd_plan_new(args: argparse.Namespace, root: Path) -> int:
         raise CliError("`--overview` cannot be empty.")
 
     todos = parse_todos(args.todo)
-    slug = slugify(args.slug or title)
-    filename = f"{slug}_{title_hash(title)}.plan.md"
-    plan_path = root / PLANS_DIR / filename
+    plan_path = root / plan_relative_path(title, args.slug)
     if plan_path.exists() and not args.force:
         raise CliError(f"Plan already exists: {plan_path.relative_to(root).as_posix()}")
 
     content = render_plan(title=title, overview=overview, todos=todos, is_project=args.is_project)
     atomic_write_text(plan_path, content)
     print(plan_path.relative_to(root).as_posix())
+    return 0
+
+
+def cmd_plan_path(args: argparse.Namespace, root: Path) -> int:
+    del root
+    title = args.title.strip()
+    if not title:
+        raise CliError("`--title` cannot be empty.")
+    print(plan_relative_path(title, args.slug))
+    return 0
+
+
+def cmd_plan_archive(args: argparse.Namespace, root: Path) -> int:
+    archive_date = parse_archive_date(args.archive_date) if args.archive_date else datetime.now().date()
+    payload = archive_scope_plan_paths(root, scope_id=args.scope, archive_date=archive_date)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -651,19 +830,11 @@ def cmd_project_init(args: argparse.Namespace, root: Path) -> int:
         atomic_write_text(path, content)
         written.append(relative_path)
 
-    status_path = get_status_path(root)
-    if status_path.exists():
-        data = read_json(status_path)
-        if not isinstance(data, dict):
-            raise CliError(f"Invalid status payload in {status_path}")
-    else:
-        data = default_status_payload()
-
-    data["project_context"] = {
-        "root": PROJECT_DIR.as_posix(),
-        "files": canonical_project_context_files(),
-    }
-    save_status(root, data)
+    with status_mutation_session(root) as data:
+        data["project_context"] = {
+            "root": PROJECT_DIR.as_posix(),
+            "files": canonical_project_context_files(),
+        }
 
     payload = {
         "project_root": PROJECT_DIR.as_posix(),
@@ -824,78 +995,114 @@ def cmd_status_next(args: argparse.Namespace, root: Path) -> int:
 
 
 def cmd_status_ensure_scope(args: argparse.Namespace, root: Path) -> int:
-    data = load_status(root)
-    scope = find_scope(data, args.id)
-    if scope is None:
-        scope = {
-            "id": args.id,
-            "title": "",
-            "status": "pending",
-            "source": "",
-            "plan_paths": [],
-            "owned_paths": [],
-            "checklist": [],
-            "verification": [],
-            "blocked_or_unverified": [],
-        }
-        scopes(data).append(scope)
+    with status_mutation_session(root) as data:
+        scope = find_scope(data, args.id)
+        if scope is None:
+            scope = {
+                "id": args.id,
+                "title": "",
+                "status": "pending",
+                "source": "",
+                "plan_paths": [],
+                "owned_paths": [],
+                "checklist": [],
+                "verification": [],
+                "blocked_or_unverified": [],
+            }
+            scopes(data).append(scope)
 
-    if args.title is not None:
-        scope["title"] = args.title
-    if args.status is not None:
-        scope["status"] = args.status
-    if args.source is not None:
-        scope["source"] = args.source
-    if args.plan_path is not None:
-        scope["plan_paths"] = normalize_unique_paths(root, args.plan_path)
-    if args.owned_path is not None:
-        scope["owned_paths"] = normalize_unique_paths(root, args.owned_path)
+        if args.title is not None:
+            scope["title"] = args.title
+        if args.status is not None:
+            scope["status"] = args.status
+        if args.source is not None:
+            scope["source"] = args.source
+        if args.clear_plan_paths:
+            scope["plan_paths"] = []
+        elif args.plan_path is not None:
+            scope["plan_paths"] = normalize_unique_paths(root, args.plan_path)
+        if args.clear_owned_paths:
+            scope["owned_paths"] = []
+        elif args.owned_path is not None:
+            scope["owned_paths"] = normalize_unique_paths(root, args.owned_path)
+    print(json.dumps(scope, indent=2, ensure_ascii=False))
+    return 0
 
-    save_status(root, data)
+
+def cmd_status_delete_scope(args: argparse.Namespace, root: Path) -> int:
+    with status_mutation_session(root) as data:
+        scope_index = find_scope_index(data, args.id)
+        if scope_index is None:
+            raise CliError(f"Scope not found: {args.id}")
+        scope = scopes(data).pop(scope_index)
     print(json.dumps(scope, indent=2, ensure_ascii=False))
     return 0
 
 
 def cmd_status_set_checklist(args: argparse.Namespace, root: Path) -> int:
-    data = load_status(root)
-    scope = require_scope(data, args.scope)
-    items = require_list_field(scope, "checklist", args.scope)
-    item = upsert_item(items, args.item_id, before_id=args.before_id, after_id=args.after_id)
-    if args.content is not None:
-        item["content"] = args.content
-    elif "content" not in item:
-        raise CliError("`--content` is required when creating a new checklist item.")
-    item["status"] = args.status
-    save_status(root, data)
+    with status_mutation_session(root) as data:
+        scope = require_scope(data, args.scope)
+        items = require_list_field(scope, "checklist", args.scope)
+        item = upsert_item(items, args.item_id, before_id=args.before_id, after_id=args.after_id)
+        if args.content is not None:
+            item["content"] = args.content
+        elif "content" not in item:
+            raise CliError("`--content` is required when creating a new checklist item.")
+        item["status"] = args.status
     print(json.dumps(item, indent=2, ensure_ascii=False))
     return 0
 
 
 def cmd_status_set_blocker(args: argparse.Namespace, root: Path) -> int:
-    data = load_status(root)
-    scope = require_scope(data, args.scope)
-    items = require_list_field(scope, "blocked_or_unverified", args.scope)
-    item = upsert_item(items, args.item_id, before_id=args.before_id, after_id=args.after_id)
-    if args.content is not None:
-        item["content"] = args.content
-    elif "content" not in item:
-        raise CliError("`--content` is required when creating a new blocker or unverified item.")
-    item["status"] = args.status
-    save_status(root, data)
+    with status_mutation_session(root) as data:
+        scope = require_scope(data, args.scope)
+        items = require_list_field(scope, "blocked_or_unverified", args.scope)
+        item = upsert_item(items, args.item_id, before_id=args.before_id, after_id=args.after_id)
+        if args.content is not None:
+            item["content"] = args.content
+        elif "content" not in item:
+            raise CliError("`--content` is required when creating a new blocker or unverified item.")
+        item["status"] = args.status
     print(json.dumps(item, indent=2, ensure_ascii=False))
     return 0
 
 
 def cmd_status_set_verification(args: argparse.Namespace, root: Path) -> int:
-    data = load_status(root)
-    scope = require_scope(data, args.scope)
-    items = require_list_field(scope, "verification", args.scope)
-    item = upsert_item(items, args.verification_id, before_id=args.before_id, after_id=args.after_id)
-    item["status"] = args.status
-    item["result"] = args.result
-    if args.command is not None:
-        item["command"] = args.command
-    save_status(root, data)
+    with status_mutation_session(root) as data:
+        scope = require_scope(data, args.scope)
+        items = require_list_field(scope, "verification", args.scope)
+        item = upsert_item(items, args.verification_id, before_id=args.before_id, after_id=args.after_id)
+        item["status"] = args.status
+        item["result"] = args.result
+        if args.command is not None:
+            item["command"] = args.command
+    print(json.dumps(item, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_status_delete_checklist(args: argparse.Namespace, root: Path) -> int:
+    with status_mutation_session(root) as data:
+        scope = require_scope(data, args.scope)
+        items = require_list_field(scope, "checklist", args.scope)
+        item = delete_item(items, args.item_id, "Checklist item")
+    print(json.dumps(item, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_status_delete_blocker(args: argparse.Namespace, root: Path) -> int:
+    with status_mutation_session(root) as data:
+        scope = require_scope(data, args.scope)
+        items = require_list_field(scope, "blocked_or_unverified", args.scope)
+        item = delete_item(items, args.item_id, "Blocked or unverified item")
+    print(json.dumps(item, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_status_delete_verification(args: argparse.Namespace, root: Path) -> int:
+    with status_mutation_session(root) as data:
+        scope = require_scope(data, args.scope)
+        items = require_list_field(scope, "verification", args.scope)
+        item = delete_item(items, args.verification_id, "Verification record")
     print(json.dumps(item, indent=2, ensure_ascii=False))
     return 0
 
@@ -928,6 +1135,14 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser = subparsers.add_parser("plan", help="Deterministic `.planr/plans` helpers.")
     plan_subparsers = plan_parser.add_subparsers(dest="plan_command", required=True)
 
+    plan_path_parser = plan_subparsers.add_parser(
+        "path",
+        help="Compute the deterministic `.planr/plans/*.plan.md` path without writing scaffold content.",
+    )
+    plan_path_parser.add_argument("--title", required=True, help="Display title for the plan.")
+    plan_path_parser.add_argument("--slug", help="Optional explicit filename slug. Defaults to a slugified title.")
+    plan_path_parser.set_defaults(func=cmd_plan_path)
+
     plan_new = plan_subparsers.add_parser("new", help="Create a deterministic `.planr/plans/*.plan.md` scaffold.")
     plan_new.add_argument("--title", required=True, help="Display title for the plan.")
     plan_new.add_argument("--overview", required=True, help="One-paragraph overview for the plan frontmatter.")
@@ -936,6 +1151,17 @@ def build_parser() -> argparse.ArgumentParser:
     plan_new.add_argument("--project", dest="is_project", action="store_true", help="Set `isProject: true`.")
     plan_new.add_argument("--force", action="store_true", help="Overwrite an existing deterministic output path.")
     plan_new.set_defaults(func=cmd_plan_new)
+
+    plan_archive = plan_subparsers.add_parser(
+        "archive",
+        help="Archive completed scope plan files into `.planr/plans/done/DD-MM/` and rewrite live scope paths.",
+    )
+    plan_archive.add_argument("--scope", required=True, help="Completed scope id whose plan paths should be archived.")
+    plan_archive.add_argument(
+        "--archive-date",
+        help="Optional local archive date override in YYYY-MM-DD for deterministic tests or backfills.",
+    )
+    plan_archive.set_defaults(func=cmd_plan_archive)
 
     status_parser = subparsers.add_parser("status", help="Deterministic `.planr/status/current.json` helpers.")
     status_subparsers = status_parser.add_subparsers(dest="status_command", required=True)
@@ -961,9 +1187,25 @@ def build_parser() -> argparse.ArgumentParser:
     ensure_scope.add_argument("--title", help="Scope title.")
     ensure_scope.add_argument("--status", choices=sorted(VALID_SCOPE_STATUSES), help="Scope status.")
     ensure_scope.add_argument("--source", help="Scope source note.")
-    ensure_scope.add_argument("--plan-path", action="append", help="Plan path to store on the scope. Repeatable.")
-    ensure_scope.add_argument("--owned-path", action="append", help="Owned path to store on the scope. Repeatable.")
+    plan_paths_group = ensure_scope.add_mutually_exclusive_group()
+    plan_paths_group.add_argument(
+        "--clear-plan-paths",
+        action="store_true",
+        help="Clear the stored `plan_paths` list before any other scope updates.",
+    )
+    plan_paths_group.add_argument("--plan-path", action="append", help="Plan path to store on the scope. Repeatable.")
+    owned_paths_group = ensure_scope.add_mutually_exclusive_group()
+    owned_paths_group.add_argument(
+        "--clear-owned-paths",
+        action="store_true",
+        help="Clear the stored `owned_paths` list before any other scope updates.",
+    )
+    owned_paths_group.add_argument("--owned-path", action="append", help="Owned path to store on the scope. Repeatable.")
     ensure_scope.set_defaults(func=cmd_status_ensure_scope)
+
+    delete_scope = status_subparsers.add_parser("delete-scope", help="Delete one scope entry.")
+    delete_scope.add_argument("--id", required=True, help="Scope id.")
+    delete_scope.set_defaults(func=cmd_status_delete_scope)
 
     set_checklist = status_subparsers.add_parser("set-checklist", help="Create or update one checklist item.")
     set_checklist.add_argument("--scope", required=True, help="Scope id.")
@@ -973,6 +1215,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_relative_order_arguments(set_checklist)
     set_checklist.set_defaults(func=cmd_status_set_checklist)
 
+    delete_checklist = status_subparsers.add_parser("delete-checklist", help="Delete one checklist item.")
+    delete_checklist.add_argument("--scope", required=True, help="Scope id.")
+    delete_checklist.add_argument("--item-id", required=True, help="Checklist item id.")
+    delete_checklist.set_defaults(func=cmd_status_delete_checklist)
+
     set_blocker = status_subparsers.add_parser("set-blocker", help="Create or update one blocked or unverified item.")
     set_blocker.add_argument("--scope", required=True, help="Scope id.")
     set_blocker.add_argument("--item-id", required=True, help="Blocked or unverified item id.")
@@ -980,6 +1227,14 @@ def build_parser() -> argparse.ArgumentParser:
     set_blocker.add_argument("--status", required=True, choices=sorted(VALID_BLOCKER_STATUSES), help="Blocked or unverified item status.")
     add_relative_order_arguments(set_blocker)
     set_blocker.set_defaults(func=cmd_status_set_blocker)
+
+    delete_blocker = status_subparsers.add_parser(
+        "delete-blocker",
+        help="Delete one blocked or unverified item.",
+    )
+    delete_blocker.add_argument("--scope", required=True, help="Scope id.")
+    delete_blocker.add_argument("--item-id", required=True, help="Blocked or unverified item id.")
+    delete_blocker.set_defaults(func=cmd_status_delete_blocker)
 
     set_verification = status_subparsers.add_parser("set-verification", help="Create or update one verification record.")
     set_verification.add_argument("--scope", required=True, help="Scope id.")
@@ -989,6 +1244,11 @@ def build_parser() -> argparse.ArgumentParser:
     set_verification.add_argument("--command", help="Optional exact command string for the verification record.")
     add_relative_order_arguments(set_verification)
     set_verification.set_defaults(func=cmd_status_set_verification)
+
+    delete_verification = status_subparsers.add_parser("delete-verification", help="Delete one verification record.")
+    delete_verification.add_argument("--scope", required=True, help="Scope id.")
+    delete_verification.add_argument("--verification-id", required=True, help="Verification record id.")
+    delete_verification.set_defaults(func=cmd_status_delete_verification)
 
     return parser
 
